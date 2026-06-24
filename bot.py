@@ -1,217 +1,169 @@
 import os
-import json
 import base64
 import logging
+import re
 import anthropic
-from datetime import datetime
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes
 )
+from database import init_db, add_meal, add_workout, get_today, get_week, reset_today
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-DATA_FILE = "fitness_data.json"
+SYSTEM_PROMPT = """Ты персональный фитнес-ассистент. Помогаешь пользователю вести здоровый образ жизни.
 
-SYSTEM_PROMPT = """Ты персональный фитнес-ассистент. Твоя задача — помогать пользователю вести здоровый образ жизни.
+Пользователь: мужчина 35-45 лет (Алексей), цель — похудеть, новичок, тренируется 4-5 дней в неделю.
+Дневная норма калорий: ~1850 ккал. Норма белка: ~140г в день.
 
-Пользователь: мужчина 35-45 лет, цель — похудеть, новичок, тренируется 4-5 дней в неделю.
-Дневная норма калорий: ~1850 ккал (дефицит для похудения).
-Норма белка: ~140г в день.
-
-Когда пользователь пишет что ел — определи калории и БЖУ и ответь в формате:
+Когда пользователь пишет что ел или присылает фото еды — ОБЯЗАТЕЛЬНО отвечай СТРОГО в таком формате:
 🍽 [Название блюда]
 Калории: X ккал
 Белки: Xг | Жиры: Xг | Углеводы: Xг
+[короткий комментарий]
 
-Когда присылает фото еды — определи блюдо и дай те же данные.
+Когда пишет о тренировке — подтверди и похвали кратко.
 
-Когда пишет о тренировке — подтверди, похвали, дай короткий совет.
-
-В конце каждого ответа добавляй итог дня если знаешь что уже ел сегодня.
-
-Отвечай по-русски, кратко и дружелюбно. Используй эмодзи умеренно."""
+Отвечай по-русски, дружелюбно и кратко."""
 
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def parse_nutrition(text):
+    cal = prot = fat = carbs = 0
+    cal_match = re.search(r'[Кк]алори[ийе][:\s]+(\d+)', text)
+    prot_match = re.search(r'[Бб]елк[иа][:\s]+(\d+)', text)
+    fat_match = re.search(r'[Жж]ир[ыа][:\s]+(\d+)', text)
+    carbs_match = re.search(r'[Уу]глевод[ыа][:\s]+(\d+)', text)
+    if cal_match: cal = int(cal_match.group(1))
+    if prot_match: prot = int(prot_match.group(1))
+    if fat_match: fat = int(fat_match.group(1))
+    if carbs_match: carbs = int(carbs_match.group(1))
+    return cal, prot, fat, carbs
 
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def get_today_key():
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-def get_user_data(user_id: str):
-    data = load_data()
-    uid = str(user_id)
-    today = get_today_key()
-    if uid not in data:
-        data[uid] = {}
-    if today not in data[uid]:
-        data[uid][today] = {"calories": 0, "protein": 0, "meals": [], "workouts": []}
-    return data, uid, today
-
-
-def save_user_day(data, uid, today, day_data):
-    data[uid][today] = day_data
-    save_data(data)
+def is_workout(text):
+    keywords = ["трениров", "подход", "приседан", "отжим", "бег", "кардио",
+                "упражнен", "жим", "тяга", "планка", "прыжк", "выпад",
+                "скакалк", "растяжк", "пресс", "турник"]
+    return any(w in text.lower() for w in keywords)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dashboard = f"\n🌐 Дашборд: {DASHBOARD_URL}" if DASHBOARD_URL else ""
     await update.message.reply_text(
-        "👋 Привет, Алексей! Я твой фитнес-бот.\n\n"
-        "📸 Отправь фото еды — посчитаю калории\n"
-        "✍️ Напиши что ел — занесу в дневник\n"
-        "💪 Расскажи о тренировке — отмечу прогресс\n\n"
-        "Команды:\n"
-        "/stats — статистика за сегодня\n"
-        "/week — итог за неделю\n"
-        "/reset — сбросить данные дня\n\n"
-        "Твоя цель: 1850 ккал/день 🎯"
+        f"👋 Привет, Алексей! Я твой фитнес-бот.\n\n"
+        f"📸 Фото еды → посчитаю калории\n"
+        f"✍️ Текст что ел → занесу в дневник\n"
+        f"💪 Тренировка → отмечу прогресс\n"
+        f"{dashboard}\n\n"
+        f"Команды:\n"
+        f"/stats — статистика за сегодня\n"
+        f"/week — итог за неделю\n"
+        f"/reset — сбросить данные дня\n\n"
+        f"Твоя цель: 1850 ккал/день 🎯"
     )
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    data, uid, today = get_user_data(user_id)
-    day = data[uid][today]
+    day = get_today(user_id)
 
-    cal = day["calories"]
-    prot = day["protein"]
-    meals = day["meals"]
-    workouts = day["workouts"]
+    cal = day["total_calories"]
+    prot = day["total_protein"]
     remaining = max(0, 1850 - cal)
     pct = min(100, int(cal / 1850 * 100))
+    bar = "🟩" * int(pct / 10) + "⬜" * (10 - int(pct / 10))
 
-    bar_filled = int(pct / 10)
-    bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+    meals_text = "\n".join(
+        f"  • {m['name']} — {m['calories']} ккал" for m in day["meals"]
+    ) if day["meals"] else "  Пока ничего"
 
-    meals_text = "\n".join(f"  • {m}" for m in meals) if meals else "  Пока ничего"
-    workouts_text = "\n".join(f"  🏋 {w}" for w in workouts) if workouts else "  Тренировок не было"
+    workouts_text = "\n".join(
+        f"  💪 {w['description'][:50]}" for w in day["workouts"]
+    ) if day["workouts"] else "  Тренировок не было"
+
+    dashboard = f"\n\n🌐 {DASHBOARD_URL}" if DASHBOARD_URL else ""
 
     text = (
-        f"📊 *Статистика за сегодня* ({today})\n\n"
+        f"📊 *Статистика за {day['date']}*\n\n"
         f"🔥 Калории: *{cal}* / 1850 ккал\n"
         f"{bar} {pct}%\n"
         f"Осталось: *{remaining}* ккал\n\n"
         f"🥩 Белок: *{prot}г* / 140г\n\n"
         f"🍽 Приёмы пищи:\n{meals_text}\n\n"
-        f"💪 Тренировки:\n{workouts_text}"
+        f"🏋 Тренировки:\n{workouts_text}"
+        f"{dashboard}"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def week_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    data = load_data()
-    uid = str(user_id)
+    data = get_week(user_id)
 
-    if uid not in data:
-        await update.message.reply_text("Пока нет данных за неделю.")
-        return
-
-    lines = ["📅 *Итог за неделю:*\n"]
+    lines = ["📅 *Итог за 7 дней:*\n"]
     total_cal = 0
-    days_count = 0
-
-    for date_key in sorted(data[uid].keys())[-7:]:
-        d = data[uid][date_key]
-        cal = d.get("calories", 0)
-        workouts = len(d.get("workouts", []))
+    for d in data["days"]:
+        date_str = str(d["date"])
+        cal = int(d["total_cal"])
         total_cal += cal
-        days_count += 1
-        w_icon = "💪" if workouts > 0 else "😴"
-        lines.append(f"{date_key}: {cal} ккал {w_icon}")
+        has_workout = date_str in data["workout_days"]
+        w_icon = "💪" if has_workout else "😴"
+        lines.append(f"{date_str}: {cal} ккал {w_icon}")
 
-    if days_count > 0:
-        avg = int(total_cal / days_count)
+    if data["days"]:
+        avg = int(total_cal / len(data["days"]))
         lines.append(f"\nСреднее: *{avg}* ккал/день")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def reset_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    data, uid, today = get_user_data(user_id)
-    data[uid][today] = {"calories": 0, "protein": 0, "meals": [], "workouts": []}
-    save_data(data)
+    reset_today(update.effective_user.id)
     await update.message.reply_text("✅ Данные за сегодня сброшены.")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
-    data, uid, today = get_user_data(user_id)
-    day = data[uid][today]
+    day = get_today(user_id)
 
-    history_text = ""
+    history = ""
     if day["meals"]:
-        history_text = f"\n\nУже съедено сегодня: {', '.join(day['meals'])}. Итого: {day['calories']} ккал, белок: {day['protein']}г."
+        eaten = ", ".join(f"{m['name']} ({m['calories']} ккал)" for m in day["meals"])
+        history = f"\n\nУже съедено сегодня: {eaten}. Итого: {day['total_calories']} ккал."
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1000,
-        system=SYSTEM_PROMPT + history_text,
+        system=SYSTEM_PROMPT + history,
         messages=[{"role": "user", "content": text}]
     )
-
     reply = response.content[0].text
 
-    # Parse calories and protein from response
-    cal_added = 0
-    prot_added = 0
-    is_workout = any(word in text.lower() for word in [
-        "трениров", "подход", "приседан", "отжим", "бег", "кардио",
-        "упражнен", "жим", "тяга", "планка", "прыжк"
-    ])
-
-    if not is_workout:
-        import re
-        cal_match = re.search(r'[Кк]алори[ийе][:\s]+(\d+)', reply)
-        prot_match = re.search(r'[Бб]елк[иа][:\s]+(\d+)', reply)
-        if cal_match:
-            cal_added = int(cal_match.group(1))
-        if prot_match:
-            prot_added = int(prot_match.group(1))
-
-        if cal_added > 0:
-            day["calories"] += cal_added
-            day["protein"] += prot_added
-            short_name = text[:40] + ("..." if len(text) > 40 else "")
-            day["meals"].append(f"{short_name} ({cal_added} ккал)")
+    if is_workout(text):
+        add_workout(user_id, text[:200])
+        await update.message.reply_text(reply, parse_mode="Markdown")
     else:
-        short_name = text[:50] + ("..." if len(text) > 50 else "")
-        day["workouts"].append(short_name)
-
-    save_user_day(data, uid, today, day)
-
-    remaining = max(0, 1850 - day["calories"])
-    if cal_added > 0:
-        reply += f"\n\n📊 Итого сегодня: *{day['calories']}* ккал | Осталось: *{remaining}* ккал"
-
-    await update.message.reply_text(reply, parse_mode="Markdown")
+        cal, prot, fat, carbs = parse_nutrition(reply)
+        if cal > 0:
+            meal_name = text[:80]
+            add_meal(user_id, meal_name, cal, prot, fat, carbs)
+            day = get_today(user_id)
+            remaining = max(0, 1850 - day["total_calories"])
+            reply += f"\n\n📊 Итого сегодня: *{day['total_calories']}* ккал | Осталось: *{remaining}* ккал"
+        await update.message.reply_text(reply, parse_mode="Markdown")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    data, uid, today = get_user_data(user_id)
-    day = data[uid][today]
-
     await update.message.reply_text("📸 Анализирую фото...")
 
     photo = update.message.photo[-1]
@@ -219,64 +171,46 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_bytes = await file.download_as_bytearray()
     image_b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
 
-    caption = update.message.caption or ""
-    history_text = ""
+    caption = update.message.caption or "Что на фото? Определи блюдо и посчитай калории."
+    day = get_today(user_id)
+    history = ""
     if day["meals"]:
-        history_text = f"\n\nУже съедено сегодня: {', '.join(day['meals'])}. Итого: {day['calories']} ккал."
+        eaten = ", ".join(f"{m['name']} ({m['calories']} ккал)" for m in day["meals"])
+        history = f"\n\nУже съедено сегодня: {eaten}. Итого: {day['total_calories']} ккал."
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1000,
-        system=SYSTEM_PROMPT + history_text,
+        system=SYSTEM_PROMPT + history,
         messages=[{
             "role": "user",
             "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_b64
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": f"Что на фото? Определи блюдо и посчитай калории. {caption}"
-                }
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                {"type": "text", "text": caption}
             ]
         }]
     )
-
     reply = response.content[0].text
 
-    import re
-    cal_match = re.search(r'[Кк]алори[ийе][:\s]+(\d+)', reply)
-    prot_match = re.search(r'[Бб]елк[иа][:\s]+(\d+)', reply)
-    cal_added = int(cal_match.group(1)) if cal_match else 0
-    prot_added = int(prot_match.group(1)) if prot_match else 0
-
-    if cal_added > 0:
-        day["calories"] += cal_added
-        day["protein"] += prot_added
-        day["meals"].append(f"📸 Фото ({cal_added} ккал)")
-        save_user_day(data, uid, today, day)
-
-        remaining = max(0, 1850 - day["calories"])
-        reply += f"\n\n📊 Итого сегодня: *{day['calories']}* ккал | Осталось: *{remaining}* ккал"
+    cal, prot, fat, carbs = parse_nutrition(reply)
+    if cal > 0:
+        add_meal(user_id, f"📸 Фото", cal, prot, fat, carbs)
+        day = get_today(user_id)
+        remaining = max(0, 1850 - day["total_calories"])
+        reply += f"\n\n📊 Итого сегодня: *{day['total_calories']}* ккал | Осталось: *{remaining}* ккал"
 
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 
 def main():
+    init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("week", week_stats))
     app.add_handler(CommandHandler("reset", reset_day))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     logger.info("Бот запущен!")
     app.run_polling()
 
