@@ -1,2 +1,1 @@
-web: gunicorn dashboard:app --bind 0.0.0.0:$PORT
-bot: python bot.py
+web: gunicorn dashboard:app --bind 0.0.0.0:$PORT --workers 1
